@@ -1,7 +1,7 @@
 # GigaGAN
 
 <img src="assets/Text2img.png" width="600px"></img>
->We present our 1B-parameter GigaGAN, achieving lower FID than Stable Diffusion v1.5, DALL·E 2, and Parti-750M. reference: https://doi.org/10.48550/arxiv.2303.05511
+> 1B-parameter GigaGAN, achieving lower FID than Stable Diffusion v1.5, DALL·E 2, and Parti-750M. Please reference: https://doi.org/10.48550/arxiv.2303.05511
 
 
 ## GigaGAN generator
