@@ -1,0 +1,10 @@
+[flake8]
+ignore = E731, E741, W504, W503, E126,E125
+max-line-length = 160
+show-source = False
+application-import-names = gigagan
+exclude =
+    .git
+    docs/
+    venv
+    build
