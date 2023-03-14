@@ -13,27 +13,102 @@ def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 
-def get_same_padding(size, kernel_size, dilation, stride):
-    """Calculate padding needed for a convolutional layer to maintain same
-    spatial dimensions as the input."""
+def get_same_padding(size: int, kernel_size: int, dilation: int,
+                     stride: int) -> int:
+    """Calculate padding size to keep output feature map size the same.
+
+    Args:
+        size (int): Input feature map size
+        kernel_size (int): Convolution kernel size
+        dilation (int): Convolution dilation
+        stride (int): Convolution stride
+
+    Returns:
+        (int): Padding size
+    """
     padding = (((size - 1) * stride) - size + (dilation *
                                                (kernel_size - 1)) + 1) // 2
     return padding
 
 
+class ChannelRMSNorm(nn.Module):
+    """
+    Channel-wise Root Mean Squared (RMS) Normalization module. 
+
+    This module normalizes the input tensor along the channel dimension using the RMS value of each channel. 
+    The output tensor is then scaled by a learnable parameter and a scaling factor.
+
+    Args:
+        dim (int): The number of channels in the input tensor.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        # Calculate the scaling factor based on the number of channels
+        self.scale = dim**0.5
+        # Initialize the scaling parameter as a learnable parameter
+        self.gamma = nn.Parameter(torch.ones(dim, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the ChannelRMSNorm module.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (batch_size, dim, height, width).
+
+        Returns:
+            torch.Tensor: The normalized and scaled tensor of shape (batch_size, dim, height, width).
+        """
+        # Normalize the input tensor along the channel dimension
+        normed = F.normalize(x, dim=1)
+        # Scale the normalized tensor by the scaling factor and the learnable scaling parameter
+        return normed * self.scale * self.gamma
+
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Squared (RMS) Normalization module. 
+
+    This module normalizes the input tensor along the last dimension using the RMS value of each element. 
+    The output tensor is then scaled by a learnable parameter and a scaling factor.
+
+    Args:
+        dim (int): The size of the last dimension in the input tensor.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        # Calculate the scaling factor based on the size of the last dimension
+        self.scale = dim**0.5
+        # Initialize the scaling parameter as a learnable parameter
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the RMSNorm module.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (batch_size, ..., dim).
+
+        Returns:
+            torch.Tensor: The normalized and scaled tensor of shape (batch_size, ..., dim).
+        """
+        # Normalize the input tensor along the last dimension
+        normed = F.normalize(x, dim=-1)
+        # Scale the normalized tensor by the scaling factor and the learnable scaling parameter
+        return normed * self.scale * self.gamma
+
+
 class AdaptiveConv2DMod(nn.Module):
     def __init__(self,
-                 dim,
-                 dim_out,
-                 dim_embed,
-                 kernel,
-                 demod=True,
-                 stride=1,
-                 dilation=1,
-                 eps=1e-8,
-                 num_conv_kernels=1):
-        """Adaptive Convolutional Layer with Modulated Weights, as used in
-        StyleGAN2.
+                 dim: int,
+                 dim_out: int,
+                 dim_embed: int,
+                 kernel: int,
+                 demod: bool = True,
+                 stride: int = 1,
+                 dilation: int = 1,
+                 eps: float = 1e-8,
+                 num_conv_kernels: Optional[int] = 1):
+        """Adaptive Convolutional Layer with Modulated Weights, as used in StyleGAN2.
 
         Args:
             dim (int): Number of input channels
@@ -44,7 +119,7 @@ class AdaptiveConv2DMod(nn.Module):
             stride (int): Convolution stride (default: 1)
             dilation (int): Convolution dilation (default: 1)
             eps (float): Small constant for numerical stability (default: 1e-8)
-            num_conv_kernels (int): Number of adaptive convolution kernels (default: 1)
+            num_conv_kernels (int, optional): Number of adaptive convolution kernels (default: 1)
 
         Note:
             If num_conv_kernels is greater than 1, the layer is adaptive and the weights are determined
@@ -76,7 +151,7 @@ class AdaptiveConv2DMod(nn.Module):
 
         self.demod = demod
 
-    def forward(self, fmap, embed):
+    def forward(self, fmap: torch.Tensor, embed: torch.Tensor) -> torch.Tensor:
         """Forward pass of Adaptive Convolutional Layer with Modulated Weights.
 
         Args:
@@ -98,10 +173,8 @@ class AdaptiveConv2DMod(nn.Module):
             selections = self.to_adaptive_weight(embed).softmax(dim=-1)
             selections = rearrange(selections, 'b n -> b n 1 1 1 1')
 
-        # do the modulation, demodulation, as done in stylegan2
-
+        # Apply weight modulation
         mod = self.to_mod(embed)
-
         mod = rearrange(mod, 'b i -> b 1 i 1 1')
 
         weights = weights * (mod + 1)
