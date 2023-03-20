@@ -4,8 +4,13 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from beartype import beartype
+from beartype.typing import List
 from einops import pack, rearrange, reduce, repeat, unpack
+from torch import einsum
+
+from gigagan.open_clip import OpenClipAdapter
+from gigagan.utils import exists, leaky_relu
 
 
 def clones(module, N):
@@ -32,10 +37,9 @@ def get_same_padding(size: int, kernel_size: int, dilation: int,
 
 
 class ChannelRMSNorm(nn.Module):
-    """
-    Channel-wise Root Mean Squared (RMS) Normalization module. 
+    """Channel-wise Root Mean Squared (RMS) Normalization module.
 
-    This module normalizes the input tensor along the channel dimension using the RMS value of each channel. 
+    This module normalizes the input tensor along the channel dimension using the RMS value of each channel.
     The output tensor is then scaled by a learnable parameter and a scaling factor.
 
     Args:
@@ -49,8 +53,7 @@ class ChannelRMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the ChannelRMSNorm module.
+        """Forward pass of the ChannelRMSNorm module.
 
         Args:
             x (torch.Tensor): The input tensor of shape (batch_size, dim, height, width).
@@ -65,10 +68,9 @@ class ChannelRMSNorm(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """
-    Root Mean Squared (RMS) Normalization module. 
+    """Root Mean Squared (RMS) Normalization module.
 
-    This module normalizes the input tensor along the last dimension using the RMS value of each element. 
+    This module normalizes the input tensor along the last dimension using the RMS value of each element.
     The output tensor is then scaled by a learnable parameter and a scaling factor.
 
     Args:
@@ -82,8 +84,7 @@ class RMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the RMSNorm module.
+        """Forward pass of the RMSNorm module.
 
         Args:
             x (torch.Tensor): The input tensor of shape (batch_size, ..., dim).
@@ -108,7 +109,8 @@ class AdaptiveConv2DMod(nn.Module):
                  dilation: int = 1,
                  eps: float = 1e-8,
                  num_conv_kernels: Optional[int] = 1):
-        """Adaptive Convolutional Layer with Modulated Weights, as used in StyleGAN2.
+        """Adaptive Convolutional Layer with Modulated Weights, as used in
+        StyleGAN2.
 
         Args:
             dim (int): Number of input channels
@@ -304,6 +306,254 @@ class MultiHeadAttention(nn.Module):
         # 4) linear proj output
         output = self.output_linear(x)
         return output, self_attn
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, dim_head=64, heads=8):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        dim_inner = dim_head * heads
+
+        self.norm = ChannelRMSNorm(dim)
+        self.norm_context = RMSNorm(dim)
+
+        self.to_q = nn.Conv2d(dim, dim_inner, 1, bias=False)
+        self.to_kv = nn.Linear(dim, dim_inner * 2, bias=False)
+        self.to_out = nn.Conv2d(dim_inner, dim, 1, bias=False)
+
+    def forward(self, fmap, context):
+        """einstein notation.
+
+        b - batch
+        h - heads
+        x - height
+        y - width
+        d - dimension
+        i - source seq (attend from)
+        j - target seq (attend to)
+        """
+
+        fmap = self.norm(fmap)
+        context = self.norm_context(context)
+
+        x, y = fmap.shape[-2:]
+
+        h = self.heads
+
+        q, k, v = (self.to_q(fmap), *self.to_kv(context).chunk(2, dim=-1))
+
+        k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
+                   (k, v))
+
+        q = rearrange(q, 'b (h d) x y -> (b h) (x y) d', h=self.heads)
+
+        sim = -torch.cdist(q, k, p=2) * self.scale  # l2 distance
+
+        attn = sim.softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', attn, v)
+
+        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', x=x, y=y, h=h)
+
+        return self.to_out(out)
+
+
+# classic transformer attention, stick with l2 distance
+
+
+class TextAttention(nn.Module):
+    def __init__(self, dim, dim_head=64, heads=8, mask_self_value=-1e2):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        dim_inner = dim_head * heads
+
+        self.mask_self_value = mask_self_value
+
+        self.norm = RMSNorm(dim)
+        self.to_qk = nn.Linear(dim, dim_inner, bias=False)
+        self.to_v = nn.Linear(dim, dim_inner, bias=False)
+
+        self.null_kv = nn.Parameter(torch.randn(2, heads, dim_head))
+
+        self.to_out = nn.Linear(dim_inner, dim, bias=False)
+
+    def forward(self, encodings, mask=None):
+        """einstein notation.
+
+        b - batch
+        h - heads
+        x - height
+        y - width
+        d - dimension
+        i - source seq (attend from)
+        j - target seq (attend to)
+        """
+        batch, device = encodings.shape[0], encodings.device
+
+        encodings = self.norm(encodings)
+
+        h = self.heads
+
+        qk, v = self.to_qk(encodings), self.to_v(encodings)
+        qk, v = map(
+            lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=self.heads),
+            (qk, v))
+
+        q, k = qk, qk
+
+        # add a null key / value, so network can choose to pay attention to nothing
+
+        nk, nv = map(lambda t: repeat(t, 'h d -> (b h) 1 d', b=batch),
+                     self.null_kv)
+
+        k = torch.cat((nk, k), dim=-2)
+        v = torch.cat((nv, v), dim=-2)
+
+        # l2 distance
+
+        sim = -torch.cdist(q, k, p=2) * self.scale
+
+        # following what was done in reformer for shared query / key space
+        # omit attention to self
+
+        self_mask = torch.eye(sim.shape[-2], device=device, dtype=torch.bool)
+        self_mask = F.pad(self_mask, (1, 0), value=False)
+
+        sim = sim.masked_fill(self_mask, self.mask_self_value)
+
+        # key padding mask
+
+        if exists(mask):
+            mask = F.pad(mask, (1, 0), value=True)
+            mask = repeat(mask, 'b n -> (b h) 1 n', h=h)
+            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+
+        # attention
+
+        attn = sim.softmax(dim=-1)
+        out = einsum('b i j, b j d -> b i d', attn, v)
+
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+
+        return self.to_out(out)
+
+
+# feedforward
+
+
+def FeedForward(dim, mult=4):
+    dim_hidden = int(dim * mult)
+    return nn.Sequential(RMSNorm(dim), nn.Linear(dim, dim_hidden), nn.GELU(),
+                         nn.Linear(dim_hidden, dim))
+
+
+# transformer
+
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, dim_head=64, heads=8, ff_mult=4):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList([
+                    TextAttention(dim=dim, dim_head=dim_head, heads=heads),
+                    FeedForward(dim=dim, mult=ff_mult)
+                ]))
+
+        self.norm = RMSNorm(dim)
+
+    def forward(self, x, mask=None):
+        for attn, ff in self.layers:
+            x = attn(x, mask=mask) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
+
+# text encoder
+
+
+@beartype
+class TextEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        clip: OpenClipAdapter,
+        dim,
+        depth,
+        dim_head=64,
+        heads=8,
+    ):
+        super().__init__()
+        self.clip = clip
+        self.learned_global_token = nn.Parameter(torch.randn(dim))
+
+        self.project_in = nn.Linear(
+            clip.dim_latent, dim) if clip.dim_latent != dim else nn.Identity()
+
+        self.transformer = Transformer(dim=dim,
+                                       depth=depth,
+                                       dim_head=dim_head,
+                                       heads=heads)
+
+    def forward(self, texts: List[str]):
+        _, text_encodings = self.clip.embed_texts(texts)
+        mask = (text_encodings != 0.).any(dim=-1)
+
+        text_encodings = self.project_in(text_encodings)
+
+        mask_with_global = F.pad(mask, (1, 0), value=True)
+
+        batch = text_encodings.shape[0]
+        global_tokens = repeat(self.learned_global_token, 'd -> b d', b=batch)
+
+        text_encodings, ps = pack([global_tokens, text_encodings], 'b * d')
+
+        text_encodings = self.transformer(text_encodings,
+                                          mask=mask_with_global)
+
+        global_tokens, text_encodings = unpack(text_encodings, ps, 'b * d')
+
+        return global_tokens, text_encodings, mask
+
+
+# style mapping network
+
+
+class StyleNetwork(nn.Module):
+    """in the stylegan2 paper, they control the learning rate by multiplying
+    the parameters by a constant, but we can use another trick here from
+    attention literature."""
+    def __init__(self, dim, depth, dim_text_latent=0, frac_gradient=0.1):
+        super().__init__()
+
+        layers = []
+        for i in range(depth):
+            layers.extend(
+                [nn.Linear(dim + dim_text_latent, dim),
+                 leaky_relu()])
+
+        self.net = nn.Sequential(*layers)
+        self.frac_gradient = frac_gradient
+        self.dim_text_latent = dim_text_latent
+
+    def forward(self, x, text_latent=None):
+        grad_frac = self.frac_gradient
+
+        if self.dim_text_latent:
+            assert exists(text_latent)
+            x = torch.cat((x, text_latent), dim=-1)
+
+        x = F.normalize(x, dim=1)
+        out = self.net(x)
+
+        return out * grad_frac + (1 - grad_frac) * out.detach()
+
+
+# gan
 
 
 # gan
