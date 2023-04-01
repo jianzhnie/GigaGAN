@@ -1,9 +1,8 @@
+import open_clip
 import torch.nn.functional as F
 from beartype import beartype
 from beartype.typing import List
 from torch import nn
-
-import open_clip
 
 
 def l2norm(t):
